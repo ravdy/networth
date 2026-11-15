@@ -1,0 +1,23 @@
+services:
+  networth:
+    build: .
+    image: networth-tracker:latest
+    container_name: networth
+    ports:
+      - "127.0.0.1:8080:8000"   # only reachable from this Mac, never from your Wi-Fi / network
+    volumes:
+      # Database, Excel file and backups live in ./data on your Mac (permanent, included in Time Machine).
+      - ./data:/data
+    environment:
+      NETWORTH_IDLE_MINUTES: "60"     # sign out after this long without activity
+      NETWORTH_SESSION_HOURS: "12"    # and always after this long
+    # hardening: the container can only write to /data and /tmp, has no Linux capabilities,
+    # and can never gain more privileges than its unprivileged app user
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

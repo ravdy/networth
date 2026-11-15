@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en-IN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Net Worth Tracker</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%232a78d6'/><text x='16' y='22' font-size='17' text-anchor='middle' fill='white' font-family='system-ui'>₹</text></svg>">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">₹</span> Net Worth</div>
+    <nav class="tabs" role="tablist">
+      <button data-tab="dashboard" class="active">Dashboard</button>
+      <button data-tab="assets">Assets</button>
+      <button data-tab="liabilities">Liabilities</button>
+      <button data-tab="insights">Insights</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+    <div class="account"><span class="muted" id="who"></span><button class="small" id="btn-logout" type="button">Log out</button></div>
+  </header>
+
+  <main>
+    <!-- DASHBOARD -->
+    <section id="tab-dashboard" class="tab active">
+      <div class="banner" id="excel-banner" hidden>
+        <span>📄 Your Excel file has changes that aren't in the app yet.</span>
+        <button class="primary small" id="excel-banner-load">Review &amp; load</button>
+      </div>
+      <div class="hero card">
+        <div>
+          <div class="eyebrow">Net worth</div>
+          <div class="hero-value" id="nw-value">—</div>
+          <div class="muted" id="nw-sub"></div>
+        </div>
+        <div class="tiles">
+          <div class="tile"><div class="eyebrow">Total assets</div><div class="tile-value" id="t-assets">—</div></div>
+          <div class="tile"><div class="eyebrow">Liabilities</div><div class="tile-value" id="t-liabs">—</div></div>
+          <div class="tile"><div class="eyebrow">Net invested</div><div class="tile-value" id="t-invested">—</div></div>
+          <div class="tile"><div class="eyebrow">Unrealised gain</div><div class="tile-value" id="t-gain">—</div></div>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <h2>Allocation by segment</h2>
+          <div class="donut-wrap" id="donut"></div>
+        </div>
+        <div class="card">
+          <h2>Allocation by group</h2>
+          <div id="type-bars" class="type-bars"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Invested vs current value</h2>
+          <select id="growth-asset" aria-label="Choose asset" class="inline-select"><option value="">All assets</option></select>
+        </div>
+        <p class="muted small">Grey = total amount invested so far, rising with each purchase or payment. Blue dots = total current value each time you update values; every new <b>Update value</b> adds a dot. Bars = growth % at each update.</p>
+        <div id="growth" class="growth"></div>
+      </div>
+
+      <div class="card">
+        <h2>Net worth over time</h2>
+        <div id="history" class="history"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Top recommendations</h2><button class="link" data-goto="insights">See all →</button></div>
+        <div id="dash-recs" class="recs"></div>
+      </div>
+    </section>
+
+    <!-- ASSETS -->
+    <section id="tab-assets" class="tab">
+      <div class="toolbar">
+        <input type="search" id="asset-search" placeholder="Search assets…" aria-label="Search assets">
+        <select id="asset-filter" aria-label="Filter by segment"><option value="">All segments</option></select>
+        <a class="btn" href="/api/excel/download" id="btn-export">Export to Excel</a>
+        <button id="btn-excel" type="button">Excel sync</button>
+        <button class="primary" id="btn-add-asset">+ Add asset</button>
+      </div>
+      <div class="card flush">
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr>
+              <th data-sort="name">Asset</th><th data-sort="first_date">Purchase date</th><th class="num" data-sort="invested">Net invested</th><th class="num" data-sort="current_value">Current value</th>
+              <th class="num" data-sort="gain">Gain</th><th class="num" data-sort="xirr">XIRR</th><th></th>
+            </tr></thead>
+            <tbody id="asset-rows"></tbody>
+            <tfoot id="asset-foot"></tfoot>
+          </table>
+        </div>
+        <div class="empty" id="asset-empty" hidden>No assets yet. Click <b>+ Add asset</b> to record your first investment.</div>
+      </div>
+    </section>
+
+    <!-- LIABILITIES -->
+    <section id="tab-liabilities" class="tab">
+      <div class="toolbar">
+        <div class="muted" id="liab-sub"></div>
+        <button class="primary" id="btn-add-liab">+ Add liability</button>
+      </div>
+      <div class="card flush">
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr>
+              <th data-sort="name">Liability</th><th data-sort="start_date">Start date</th><th class="num" data-sort="tenure_months">Tenure</th><th data-sort="end_date">End date</th>
+              <th class="num" data-sort="principal">Original</th><th class="num" data-sort="outstanding">Outstanding</th>
+              <th class="num" data-sort="interest_rate">Rate</th><th class="num" data-sort="emi">EMI</th><th data-sort="repaid_pct">Repaid</th><th></th>
+            </tr></thead>
+            <tbody id="liab-rows"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="liab-empty" hidden>No liabilities recorded. Debt-free? Nice. Otherwise add home loans, credit cards, etc.</div>
+      </div>
+    </section>
+
+    <!-- INSIGHTS -->
+    <section id="tab-insights" class="tab">
+      <div class="card">
+        <h2>Financial assets: current vs target</h2>
+        <p class="muted" id="target-sub"></p>
+        <div id="target-chart" class="target-chart"></div>
+        <div class="table-wrap">
+          <table class="data compact" id="target-table"></table>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Recommendations</h2>
+        <div id="all-recs" class="recs"></div>
+      </div>
+      <div class="card">
+        <h2>Indian tax &amp; product notes</h2>
+        <dl id="notes" class="notes"></dl>
+        <p class="disclaimer" id="disclaimer"></p>
+      </div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section id="tab-settings" class="tab">
+      <div class="card narrow">
+        <h2>Your profile</h2>
+        <p class="muted">Used only to tailor recommendations. Everything stays on this machine.</p>
+        <form id="settings-form" class="form">
+          <label>Name<input name="name" autocomplete="off"></label>
+          <label>Age<input name="age" type="number" min="15" max="100"></label>
+          <label>Risk profile
+            <select name="risk_profile">
+              <option value="conservative">Conservative — capital safety first</option>
+              <option value="moderate">Moderate — balanced growth</option>
+              <option value="aggressive">Aggressive — long horizon, high growth</option>
+            </select>
+          </label>
+          <label>Monthly household expenses (₹)<input name="monthly_expenses" type="number" min="0" step="any"></label>
+          <label>Annual take-home income (₹)<input name="annual_income" type="number" min="0" step="any"></label>
+          <label>Number of dependents<input name="dependents" type="number" min="0"></label>
+          <label>Income-tax regime
+            <select name="tax_regime"><option value="new">New regime</option><option value="old">Old regime</option></select>
+          </label>
+          <div class="actions"><button class="primary" type="submit">Save profile</button></div>
+        </form>
+      </div>
+      <div class="card narrow" id="excel-card">
+        <h2>Excel sync</h2>
+        <p class="muted">Keep your data in an Excel file at <code>Networth/data/networth.xlsx</code>. Edit it in Excel, save, then click <b>Load changes from Excel</b>; you'll see exactly what will change before it's applied. Changes you make here in the app are written back to the file automatically.</p>
+        <div id="excel-status" class="muted small-status"></div>
+        <div class="actions left wrap">
+          <button class="primary" id="excel-load">Load changes from Excel</button>
+          <button id="excel-create">Create / refresh Excel file</button>
+          <a class="btn" href="/api/excel/download">Download a copy</a>
+          <label class="btn">Load from another file…<input type="file" id="excel-upload" accept=".xlsx" hidden></label>
+        </div>
+      </div>
+      <div class="card narrow">
+        <h2>Account &amp; security</h2>
+        <p class="muted" id="account-sub"></p>
+        <form id="password-form" class="form">
+          <label>Current password<input type="password" name="current" autocomplete="current-password" required></label>
+          <div class="row">
+            <label>New password<input type="password" name="new" autocomplete="new-password" minlength="10" required></label>
+            <label>Repeat new password<input type="password" name="confirm" autocomplete="new-password" minlength="10" required></label>
+          </div>
+          <div class="actions"><button class="primary" type="submit">Change password</button></div>
+        </form>
+      </div>
+      <div class="card narrow">
+        <h2>Backup</h2>
+        <p class="muted">Data lives in the <code>data/</code> folder next to the app, with automatic daily backups in <code>data/backups/</code>. Export a JSON backup occasionally.</p>
+        <div class="actions left">
+          <a class="btn" href="/api/export" download="networth-backup.json">Export backup (JSON)</a>
+          <a class="btn" href="/api/export/docx">Export report (Word)</a>
+          <label class="btn">Import backup<input type="file" id="import-file" accept="application/json" hidden></label>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="modal"><form method="dialog" id="modal-form" class="form"></form></dialog>
+  <div id="tooltip" class="tooltip" hidden></div>
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+# Demo copy of the app with made-up data. Completely separate from your real data:
+# own container, own data folder (./demo-data), own port (8081).
+#
+#   docker compose -f docker-compose.demo.yml up -d --build      # start demo
+#   docker compose -f docker-compose.demo.yml exec -T networth-demo python - < demo/seed_demo.py   # (re)load dummy data
+#   docker compose -f docker-compose.demo.yml down               # stop demo
+name: networth-demo
+services:
+  networth-demo:
+    build: .
+    image: networth-tracker:latest
+    container_name: networth-demo
+    ports: ["127.0.0.1:8081:8000"]
+    volumes: [./demo-data:/data]
+    environment: {NETWORTH_DEMO: "1", NETWORTH_IDLE_MINUTES: "240", NETWORTH_SESSION_HOURS: "12"}
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
