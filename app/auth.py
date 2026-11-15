@@ -1,12 +1,18 @@
-"""Single-owner authentication: scrypt password hashes + server-side sessions.
+"""Authentication: accounts with scrypt password hashes + server-side sessions.
+
+Each account has its own private portfolio. Sign-up from the browser is on by default
+(NETWORTH_ALLOW_SIGNUP=0 turns it off; the very first account can always be created).
 
 Password reset (inside the container):
-    docker compose exec -it networth python -m app.auth reset
+    docker compose exec -it networth python -m app.auth reset [username]
+List accounts:
+    docker compose exec networth python -m app.auth list
 """
 import getpass
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sys
 import time
@@ -18,6 +24,9 @@ COOKIE = "nw_session"
 IDLE_MINUTES = int(os.environ.get("NETWORTH_IDLE_MINUTES", "60"))
 MAX_HOURS = int(os.environ.get("NETWORTH_SESSION_HOURS", "12"))
 MIN_PASSWORD = 10
+ALLOW_SIGNUP = os.environ.get("NETWORTH_ALLOW_SIGNUP", "1").lower() not in ("0", "false", "no", "off")
+SIGNUPS_PER_HOUR = int(os.environ.get("NETWORTH_SIGNUPS_PER_HOUR", "20"))
+USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{2,59}$")
 
 # scrypt parameters (~50 ms per check): N=2^15, r=8, p=1
 _N, _R, _P = 2 ** 15, 8, 1
@@ -57,9 +66,32 @@ def user_count(con) -> int:
     return con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
 
-def create_user(con, username: str, pw: str):
-    con.execute("INSERT INTO users(username, pw_hash, created_at) VALUES (?,?,?)",
-                (username.strip(), hash_password(pw), datetime.now().isoformat(timespec="seconds")))
+def username_problem(con, username: str):
+    u = username.strip()
+    if not USERNAME_RE.match(u):
+        return "Username: 3–60 characters, letters, numbers and . _ @ + - (an email address works)."
+    if con.execute("SELECT 1 FROM users WHERE username=? COLLATE NOCASE", (u,)).fetchone():
+        return "That username is taken. Pick another, or sign in."
+    return None
+
+
+def create_user(con, username: str, pw: str) -> int:
+    return con.execute("INSERT INTO users(username, pw_hash, created_at) VALUES (?,?,?)",
+                       (username.strip(), hash_password(pw), datetime.now().isoformat(timespec="seconds"))).lastrowid
+
+
+_signups: list = []
+
+
+def signup_allowed_now() -> bool:
+    """Simple flood guard: at most SIGNUPS_PER_HOUR new accounts per hour."""
+    now = time.time()
+    _signups[:] = [t for t in _signups if now - t < 3600]
+    return len(_signups) < SIGNUPS_PER_HOUR
+
+
+def note_signup():
+    _signups.append(time.time())
 
 
 def check_login(con, username: str, pw: str):
@@ -138,16 +170,29 @@ def record_success(username: str):
 # ---------- CLI: password reset ----------
 
 def _cli():
-    if len(sys.argv) < 2 or sys.argv[1] != "reset":
-        print("usage: python -m app.auth reset")
+    if len(sys.argv) < 2 or sys.argv[1] not in ("reset", "list"):
+        print("usage: python -m app.auth reset [username]   |   python -m app.auth list")
         sys.exit(2)
     init_db()
     with connect() as con:
-        users = con.execute("SELECT id, username FROM users").fetchall()
+        users = con.execute("SELECT id, username, created_at FROM users ORDER BY id").fetchall()
         if not users:
             print("No account yet - open the app in your browser to create one.")
             return
-        u = users[0]
+        if sys.argv[1] == "list":
+            for u in users:
+                print(f"{u['id']:>4}  {u['username']:<40} created {u['created_at']}")
+            return
+        if len(sys.argv) > 2:
+            u = next((x for x in users if x["username"].lower() == sys.argv[2].lower()), None)
+            if not u:
+                print(f"No account called '{sys.argv[2]}'. Run: python -m app.auth list")
+                sys.exit(1)
+        elif len(users) == 1:
+            u = users[0]
+        else:
+            print("Several accounts exist - say which one: python -m app.auth reset <username>")
+            sys.exit(1)
         print(f"Resetting password for '{u['username']}'.")
         pw = getpass.getpass("New password: ")
         if pw != getpass.getpass("Repeat: "):

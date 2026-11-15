@@ -2,6 +2,7 @@ import asyncio
 import base64
 import calendar
 import os
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Literal, Optional
@@ -11,9 +12,9 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
-from . import auth, excel, portfolio, recommendations, report
+from . import auth, demo_data, excel, portfolio, recommendations, report
 from .catalog import ASSET_TYPE_MAP, LIABILITY_TYPE_MAP, meta
-from .db import backup, connect, daily_backup_if_needed, init_db, today
+from .db import backup, claim_orphans, connect, daily_backup_if_needed, init_db, today
 
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 
@@ -181,13 +182,29 @@ class SettingsIn(BaseModel):
 
 # ---------- helpers ----------
 
-def _exists(con, table, id_):
-    if not con.execute(f"SELECT 1 FROM {table} WHERE id=?", (id_,)).fetchone():
-        raise HTTPException(404, f"{table[:-1]} not found")
+def _uid(request: Request) -> int:
+    """The signed-in account. Set by the security middleware; every data query is limited to it."""
+    return request.state.user_id
 
 
-def _asset(con, id_):
-    for a in portfolio.load_assets(con):
+# Ownership checks: an ID that belongs to another account is treated exactly like one that doesn't exist.
+_OWNED = {
+    "asset": "SELECT 1 FROM assets WHERE id=? AND user_id=?",
+    "transaction": "SELECT 1 FROM transactions x JOIN assets a ON a.id=x.asset_id WHERE x.id=? AND a.user_id=?",
+    "valuation": "SELECT 1 FROM valuations x JOIN assets a ON a.id=x.asset_id WHERE x.id=? AND a.user_id=?",
+    "liability": "SELECT 1 FROM liabilities WHERE id=? AND user_id=?",
+    "balance update": "SELECT 1 FROM liability_updates x JOIN liabilities l ON l.id=x.liability_id "
+                      "WHERE x.id=? AND l.user_id=?",
+}
+
+
+def _own(con, kind, id_, uid):
+    if not con.execute(_OWNED[kind], (id_, uid)).fetchone():
+        raise HTTPException(404, f"{kind} not found")
+
+
+def _asset(con, uid, id_):
+    for a in portfolio.load_assets(con, uid):
         if a["id"] == id_:
             return a
     raise HTTPException(404, "asset not found")
@@ -206,21 +223,23 @@ def get_meta():
 
 
 @app.get("/api/summary")
-def get_summary():
+def get_summary(request: Request):
     with connect() as con:
-        return portfolio.summary(con)
+        return portfolio.summary(con, _uid(request))
 
 
 @app.get("/api/assets")
-def list_assets():
+def list_assets(request: Request):
     with connect() as con:
-        return portfolio.load_assets(con)
+        return portfolio.load_assets(con, _uid(request))
 
 
 @app.post("/api/assets", status_code=201)
-def create_asset(body: AssetIn):
+def create_asset(body: AssetIn, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        cur = con.execute("INSERT INTO assets(name, type, notes) VALUES (?,?,?)", (body.name.strip(), body.type, body.notes))
+        cur = con.execute("INSERT INTO assets(name, type, notes, user_id) VALUES (?,?,?,?)",
+                          (body.name.strip(), body.type, body.notes, uid))
         aid = cur.lastrowid
         if body.purchase and body.purchase.amount > 0:
             p = body.purchase
@@ -228,14 +247,14 @@ def create_asset(body: AssetIn):
                         (aid, p.date, "BUY", p.amount, p.units, p.note))
         if body.current_value is not None:
             con.execute("INSERT INTO valuations(asset_id, date, value) VALUES (?,?,?)", (aid, today(), body.current_value))
-        portfolio.record_snapshot(con)
-        return _asset(con, aid)
+        portfolio.record_snapshot(con, uid)
+        return _asset(con, uid, aid)
 
 
 @app.get("/api/assets/{aid}")
-def get_asset(aid: int):
+def get_asset(aid: int, request: Request):
     with connect() as con:
-        a = _asset(con, aid)
+        a = _asset(con, _uid(request), aid)
         a["transactions"] = [dict(r) for r in con.execute(
             "SELECT * FROM transactions WHERE asset_id=? ORDER BY date DESC, id DESC", (aid,))]
         a["valuations"] = [dict(r) for r in con.execute(
@@ -244,107 +263,118 @@ def get_asset(aid: int):
 
 
 @app.put("/api/assets/{aid}")
-def update_asset(aid: int, body: AssetUpdate):
+def update_asset(aid: int, body: AssetUpdate, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "assets", aid)
+        _own(con, "asset", aid, uid)
         con.execute("UPDATE assets SET name=?, type=?, notes=? WHERE id=?", (body.name.strip(), body.type, body.notes, aid))
-        portfolio.record_snapshot(con)
-        return _asset(con, aid)
+        portfolio.record_snapshot(con, uid)
+        return _asset(con, uid, aid)
 
 
 @app.delete("/api/assets/{aid}", status_code=204)
-def delete_asset(aid: int):
+def delete_asset(aid: int, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "assets", aid)
+        _own(con, "asset", aid, uid)
         con.execute("DELETE FROM assets WHERE id=?", (aid,))
-        portfolio.record_snapshot(con)
+        portfolio.record_snapshot(con, uid)
 
 
 @app.post("/api/assets/{aid}/transactions", status_code=201)
-def add_tx(aid: int, body: TxIn):
+def add_tx(aid: int, body: TxIn, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "assets", aid)
+        _own(con, "asset", aid, uid)
         con.execute("INSERT INTO transactions(asset_id, date, kind, amount, units, note) VALUES (?,?,?,?,?,?)",
                     (aid, body.date, body.kind, body.amount, body.units, body.note))
-        portfolio.record_snapshot(con)
-        return _asset(con, aid)
+        portfolio.record_snapshot(con, uid)
+        return _asset(con, uid, aid)
 
 
 @app.post("/api/assets/{aid}/transactions/recurring", status_code=201)
-def add_recurring(aid: int, body: RecurringIn):
+def add_recurring(aid: int, body: RecurringIn, request: Request):
+    uid = _uid(request)
     dates = schedule(body.start_date, body.end_date, body.frequency)
     if not dates:
         raise HTTPException(400, "no payment dates between start and end (dates in the future are skipped)")
     label = {"monthly": "Monthly", "quarterly": "Quarterly", "half_yearly": "Half-yearly", "yearly": "Yearly"}[body.frequency]
     with connect() as con:
-        _exists(con, "assets", aid)
+        _own(con, "asset", aid, uid)
         con.executemany(
             "INSERT INTO transactions(asset_id, date, kind, amount, units, note) VALUES (?,?,?,?,?,?)",
             [(aid, d, "BUY", body.amount, body.units, body.note or f"{label} payment") for d in dates])
-        portfolio.record_snapshot(con)
+        portfolio.record_snapshot(con, uid)
         return {"created": len(dates), "total": round(len(dates) * body.amount, 2),
-                "first": dates[0], "last": dates[-1], "asset": _asset(con, aid)}
+                "first": dates[0], "last": dates[-1], "asset": _asset(con, uid, aid)}
 
 
 @app.put("/api/transactions/{tid}")
-def update_tx(tid: int, body: TxIn):
+def update_tx(tid: int, body: TxIn, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "transactions", tid)
+        _own(con, "transaction", tid, uid)
         con.execute("UPDATE transactions SET date=?, kind=?, amount=?, units=?, note=? WHERE id=?",
                     (body.date, body.kind, body.amount, body.units, body.note, tid))
-        portfolio.record_snapshot(con)
+        portfolio.record_snapshot(con, uid)
         return {"ok": True}
 
 
 @app.delete("/api/transactions/{tid}", status_code=204)
-def delete_tx(tid: int):
+def delete_tx(tid: int, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "transactions", tid)
+        _own(con, "transaction", tid, uid)
         con.execute("DELETE FROM transactions WHERE id=?", (tid,))
-        portfolio.record_snapshot(con)
+        portfolio.record_snapshot(con, uid)
 
 
 @app.post("/api/assets/{aid}/valuations", status_code=201)
-def add_valuation(aid: int, body: ValuationIn):
+def add_valuation(aid: int, body: ValuationIn, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "assets", aid)
+        _own(con, "asset", aid, uid)
         con.execute("INSERT INTO valuations(asset_id, date, value) VALUES (?,?,?)", (aid, body.date, body.value))
-        portfolio.record_snapshot(con)
-        return _asset(con, aid)
+        portfolio.record_snapshot(con, uid)
+        return _asset(con, uid, aid)
 
 
 @app.delete("/api/valuations/{vid}", status_code=204)
-def delete_valuation(vid: int):
+def delete_valuation(vid: int, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "valuations", vid)
+        _own(con, "valuation", vid, uid)
         con.execute("DELETE FROM valuations WHERE id=?", (vid,))
-        portfolio.record_snapshot(con)
+        portfolio.record_snapshot(con, uid)
 
 
 @app.get("/api/liabilities")
-def list_liabilities():
+def list_liabilities(request: Request):
     with connect() as con:
-        return portfolio.load_liabilities(con)
+        return portfolio.load_liabilities(con, _uid(request))
 
 
 @app.post("/api/liabilities", status_code=201)
-def create_liability(body: LiabilityIn):
+def create_liability(body: LiabilityIn, request: Request):
+    uid = _uid(request)
     with connect() as con:
         cur = con.execute(
-            "INSERT INTO liabilities(name, type, principal, interest_rate, emi, tenure_months, start_date, notes) VALUES (?,?,?,?,?,?,?,?)",
-            (body.name.strip(), body.type, body.principal, body.interest_rate, body.emi, body.tenure_months, body.start_date, body.notes))
+            "INSERT INTO liabilities(name, type, principal, interest_rate, emi, tenure_months, start_date, notes, user_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (body.name.strip(), body.type, body.principal, body.interest_rate, body.emi, body.tenure_months,
+             body.start_date, body.notes, uid))
         lid = cur.lastrowid
         if body.outstanding is not None and body.outstanding != body.principal:
             con.execute("INSERT INTO liability_updates(liability_id, date, outstanding) VALUES (?,?,?)",
                         (lid, today(), body.outstanding))
-        portfolio.record_snapshot(con)
+        portfolio.record_snapshot(con, uid)
         return {"id": lid}
 
 
 @app.get("/api/liabilities/{lid}")
-def get_liability(lid: int):
+def get_liability(lid: int, request: Request):
     with connect() as con:
-        for l in portfolio.load_liabilities(con):
+        for l in portfolio.load_liabilities(con, _uid(request)):
             if l["id"] == lid:
                 l["updates"] = [dict(r) for r in con.execute(
                     "SELECT * FROM liability_updates WHERE liability_id=? ORDER BY date DESC, id DESC", (lid,))]
@@ -353,199 +383,263 @@ def get_liability(lid: int):
 
 
 @app.put("/api/liabilities/{lid}")
-def update_liability(lid: int, body: LiabilityIn):
+def update_liability(lid: int, body: LiabilityIn, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "liabilities", lid)
+        _own(con, "liability", lid, uid)
         con.execute(
             "UPDATE liabilities SET name=?, type=?, principal=?, interest_rate=?, emi=?, tenure_months=?, start_date=?, notes=? WHERE id=?",
             (body.name.strip(), body.type, body.principal, body.interest_rate, body.emi, body.tenure_months, body.start_date, body.notes, lid))
-        portfolio.record_snapshot(con)
+        portfolio.record_snapshot(con, uid)
         return {"id": lid}
 
 
 @app.delete("/api/liabilities/{lid}", status_code=204)
-def delete_liability(lid: int):
+def delete_liability(lid: int, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "liabilities", lid)
+        _own(con, "liability", lid, uid)
         con.execute("DELETE FROM liabilities WHERE id=?", (lid,))
-        portfolio.record_snapshot(con)
+        portfolio.record_snapshot(con, uid)
 
 
 @app.post("/api/liabilities/{lid}/updates", status_code=201)
-def add_outstanding(lid: int, body: OutstandingIn):
+def add_outstanding(lid: int, body: OutstandingIn, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "liabilities", lid)
+        _own(con, "liability", lid, uid)
         con.execute("INSERT INTO liability_updates(liability_id, date, outstanding) VALUES (?,?,?)",
                     (lid, body.date, body.outstanding))
-        portfolio.record_snapshot(con)
+        portfolio.record_snapshot(con, uid)
         return {"ok": True}
 
 
-@app.delete("/api/liability-updates/{uid}", status_code=204)
-def delete_outstanding(uid: int):
+@app.delete("/api/liability-updates/{upd_id}", status_code=204)
+def delete_outstanding(upd_id: int, request: Request):
+    uid = _uid(request)
     with connect() as con:
-        _exists(con, "liability_updates", uid)
-        con.execute("DELETE FROM liability_updates WHERE id=?", (uid,))
-        portfolio.record_snapshot(con)
+        _own(con, "balance update", upd_id, uid)
+        con.execute("DELETE FROM liability_updates WHERE id=?", (upd_id,))
+        portfolio.record_snapshot(con, uid)
 
 
 @app.get("/api/settings")
-def read_settings():
+def read_settings(request: Request):
     with connect() as con:
-        return portfolio.get_settings(con)
+        return portfolio.get_settings(con, _uid(request))
 
 
 @app.put("/api/settings")
-def write_settings(body: SettingsIn):
+def write_settings(body: SettingsIn, request: Request):
+    uid = _uid(request)
     with connect() as con:
         for k, v in body.model_dump().items():
-            con.execute("INSERT INTO settings(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                        (k, "" if v is None else str(v)))
-        return portfolio.get_settings(con)
+            con.execute("INSERT INTO settings(user_id, key, value) VALUES (?,?,?) "
+                        "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value",
+                        (uid, k, "" if v is None else str(v)))
+        return portfolio.get_settings(con, uid)
 
 
 @app.get("/api/growth")
-def get_growth(asset_id: Optional[int] = None):
+def get_growth(request: Request, asset_id: Optional[int] = None):
+    uid = _uid(request)
     with connect() as con:
         if asset_id:
-            _exists(con, "assets", asset_id)
-        return portfolio.growth_series(con, asset_id)
+            _own(con, "asset", asset_id, uid)
+        return portfolio.growth_series(con, uid, asset_id)
 
 
 @app.get("/api/recommendations")
-def get_recommendations():
+def get_recommendations(request: Request):
+    uid = _uid(request)
     with connect() as con:
-        s = portfolio.get_settings(con)
-        assets = portfolio.load_assets(con)
-        liabs = portfolio.load_liabilities(con)
-        summ = portfolio.summary(con)
+        s = portfolio.get_settings(con, uid)
+        assets = portfolio.load_assets(con, uid)
+        liabs = portfolio.load_liabilities(con, uid)
+        summ = portfolio.summary(con, uid)
         return recommendations.build(s, assets, liabs, summ)
+
+
+# ---------- JSON backup of one account ----------
+
+def _user_rows(con, uid):
+    q = {
+        "assets": ("SELECT * FROM assets WHERE user_id=?", (uid,)),
+        "transactions": ("SELECT x.* FROM transactions x JOIN assets a ON a.id=x.asset_id WHERE a.user_id=?", (uid,)),
+        "valuations": ("SELECT x.* FROM valuations x JOIN assets a ON a.id=x.asset_id WHERE a.user_id=?", (uid,)),
+        "liabilities": ("SELECT * FROM liabilities WHERE user_id=?", (uid,)),
+        "liability_updates": ("SELECT x.* FROM liability_updates x JOIN liabilities l ON l.id=x.liability_id "
+                              "WHERE l.user_id=?", (uid,)),
+        "settings": ("SELECT key, value FROM settings WHERE user_id=? AND key NOT LIKE '\\_%' ESCAPE '\\'", (uid,)),
+        "snapshots": ("SELECT date, assets, liabilities FROM snapshots WHERE user_id=?", (uid,)),
+    }
+    out = {}
+    for t, (sql, args) in q.items():
+        out[t] = [{k: v for k, v in dict(r).items() if k != "user_id"} for r in con.execute(sql, args)]
+    return out
 
 
 TABLES = ["assets", "transactions", "valuations", "liabilities", "liability_updates", "settings", "snapshots"]
 
 
 @app.get("/api/export")
-def export_all():
+def export_all(request: Request):
     with connect() as con:
-        data = {t: [dict(r) for r in con.execute(f"SELECT * FROM {t}")] for t in TABLES}
+        data = _user_rows(con, _uid(request))
     data["exported_at"] = datetime.now().isoformat(timespec="seconds")
     return data
+
+
+@app.post("/api/import")
+def import_all(data: dict, request: Request):
+    """Replace this account's data with a backup. IDs are re-numbered, so a backup can never
+    touch another account's records."""
+    uid = _uid(request)
+    missing = [t for t in TABLES if t not in data or not isinstance(data[t], list)]
+    if missing:
+        raise HTTPException(400, f"backup is missing: {', '.join(missing)}")
+    backup("before-import")
+    try:
+        with connect() as con:
+            con.execute("DELETE FROM assets WHERE user_id=?", (uid,))        # cascades to transactions/valuations
+            con.execute("DELETE FROM liabilities WHERE user_id=?", (uid,))   # cascades to balance updates
+            con.execute("DELETE FROM settings WHERE user_id=? AND key NOT LIKE '\\_%' ESCAPE '\\'", (uid,))
+            con.execute("DELETE FROM snapshots WHERE user_id=?", (uid,))
+            amap, lmap = {}, {}
+            for a in data["assets"]:
+                amap[a["id"]] = con.execute(
+                    "INSERT INTO assets(name, type, notes, created_at, user_id) VALUES (?,?,?,COALESCE(?, date('now')),?)",
+                    (a["name"], a["type"], a.get("notes") or "", a.get("created_at"), uid)).lastrowid
+            for t in data["transactions"]:
+                if t.get("asset_id") in amap:
+                    con.execute("INSERT INTO transactions(asset_id, date, kind, amount, units, note) VALUES (?,?,?,?,?,?)",
+                                (amap[t["asset_id"]], t["date"], t["kind"], t["amount"], t.get("units"), t.get("note") or ""))
+            for v in data["valuations"]:
+                if v.get("asset_id") in amap:
+                    con.execute("INSERT INTO valuations(asset_id, date, value) VALUES (?,?,?)",
+                                (amap[v["asset_id"]], v["date"], v["value"]))
+            for l in data["liabilities"]:
+                lmap[l["id"]] = con.execute(
+                    "INSERT INTO liabilities(name, type, principal, interest_rate, emi, start_date, tenure_months, notes, user_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (l["name"], l["type"], l.get("principal") or 0, l.get("interest_rate"), l.get("emi"),
+                     l.get("start_date"), l.get("tenure_months"), l.get("notes") or "", uid)).lastrowid
+            for u in data["liability_updates"]:
+                if u.get("liability_id") in lmap:
+                    con.execute("INSERT INTO liability_updates(liability_id, date, outstanding) VALUES (?,?,?)",
+                                (lmap[u["liability_id"]], u["date"], u["outstanding"]))
+            for s in data["settings"]:
+                if not str(s.get("key", "_")).startswith("_"):
+                    con.execute("INSERT INTO settings(user_id, key, value) VALUES (?,?,?) "
+                                "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value", (uid, s["key"], s.get("value")))
+            for s in data["snapshots"]:
+                con.execute("INSERT OR REPLACE INTO snapshots(user_id, date, assets, liabilities) VALUES (?,?,?,?)",
+                            (uid, s["date"], s["assets"], s["liabilities"]))
+            portfolio.record_snapshot(con, uid)
+    except (KeyError, TypeError, sqlite3.Error) as e:
+        raise HTTPException(400, f"This doesn't look like a backup from this app ({e}). Nothing was changed.")
+    return {"ok": True}
 
 
 # ---------- Excel sync ----------
 
 class ExcelIn(BaseModel):
-    data_base64: Optional[str] = None   # uploaded file; omitted = use data/networth.xlsx
+    data_base64: Optional[str] = None   # uploaded file; omitted = use this account's file in data/
 
 
-def _excel_bytes(body: ExcelIn) -> bytes:
+def _excel_bytes(con, uid, body: ExcelIn) -> bytes:
     if body.data_base64:
         return base64.b64decode(body.data_base64.split(",")[-1])
-    if not os.path.exists(excel.XLSX_PATH):
+    path = excel.xlsx_path(con, uid)
+    if not os.path.exists(path):
         raise HTTPException(404, "No Excel file yet — create it first")
-    with open(excel.XLSX_PATH, "rb") as f:
+    with open(path, "rb") as f:
         return f.read()
 
 
 @app.get("/api/excel/status")
-def excel_status():
+def excel_status(request: Request):
     with connect() as con:
-        return excel.status(con)
+        return excel.status(con, _uid(request))
 
 
 @app.post("/api/excel/export")
-def excel_export(force: bool = False):
+def excel_export(request: Request, force: bool = False):
+    uid = _uid(request)
     with connect() as con:
-        st = excel.status(con)
+        st = excel.status(con, uid)
         if st["pending"] and not force:
             raise HTTPException(409, "The Excel file has edits that haven't been loaded yet. "
                                      "Load them first, or overwrite to discard them.")
-        excel.write_file(con)
-        return excel.status(con)
+        excel.write_file(con, uid)
+        return excel.status(con, uid)
 
 
 @app.get("/api/excel/download")
-def excel_download():
+def excel_download(request: Request):
     with connect() as con:
-        data = excel.workbook_bytes(con)
+        data = excel.workbook_bytes(con, _uid(request))
     return Response(content=data,
                     media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f'attachment; filename="networth-{today()}.xlsx"'})
 
 
 @app.post("/api/excel/preview")
-def excel_preview(body: ExcelIn):
-    data = _excel_bytes(body)
+def excel_preview(body: ExcelIn, request: Request):
+    uid = _uid(request)
     with connect() as con:
+        data = _excel_bytes(con, uid, body)
         try:
-            changes, warnings, _ = excel.plan_changes(con, data)
+            changes, warnings, _ = excel.plan_changes(con, uid, data)
         except Exception as e:  # unreadable / wrong file
             raise HTTPException(400, f"Couldn't read the Excel file: {e}")
         return {"changes": changes, "warnings": warnings}
 
 
 @app.post("/api/excel/apply")
-def excel_apply(body: ExcelIn):
-    data = _excel_bytes(body)
+def excel_apply(body: ExcelIn, request: Request):
+    uid = _uid(request)
+    with connect() as con:
+        data = _excel_bytes(con, uid, body)
     backup("before-excel-import")
     with connect() as con:
         try:
-            changes, warnings, ops = excel.plan_changes(con, data)
+            changes, warnings, ops = excel.plan_changes(con, uid, data)
         except Exception as e:
             raise HTTPException(400, f"Couldn't read the Excel file: {e}")
-        excel.apply_ops(con, ops)
-        portfolio.record_snapshot(con)
+        excel.apply_ops(con, uid, ops)
+        portfolio.record_snapshot(con, uid)
     with connect() as con:   # refresh the file so its snapshot matches the database again
-        excel.write_file(con)
+        excel.write_file(con, uid)
     return {"applied": len(changes), "warnings": warnings}
 
 
 @app.middleware("http")
 async def refresh_excel_after_changes(request: Request, call_next):
-    """Keep data/networth.xlsx current after edits made in the app (never over unloaded Excel edits)."""
+    """Keep the account's Excel file current after edits made in the app (never over unloaded Excel edits)."""
     response = await call_next(request)
-    if (request.method in ("POST", "PUT", "DELETE") and request.url.path.startswith("/api/")
+    uid = getattr(request.state, "user_id", None)
+    if (uid and request.method in ("POST", "PUT", "DELETE") and request.url.path.startswith("/api/")
             and not request.url.path.startswith(("/api/excel", "/api/auth")) and response.status_code < 400):
         try:
             with connect() as con:
-                if os.path.exists(excel.XLSX_PATH) and not excel.status(con)["pending"]:
-                    excel.write_file(con)
+                if os.path.exists(excel.xlsx_path(con, uid)) and not excel.status(con, uid)["pending"]:
+                    excel.write_file(con, uid)
         except Exception as e:  # never fail the user's request because of the Excel copy
             print(f"excel refresh skipped: {e}", flush=True)
     return response
 
 
 @app.get("/api/export/docx")
-def export_docx():
+def export_docx(request: Request):
     with connect() as con:
-        data = report.build_docx(con)
+        data = report.build_docx(con, _uid(request))
     fname = f"networth-report-{today()}.docx"
     return Response(
         content=data,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
-
-
-@app.post("/api/import")
-def import_all(data: dict):
-    missing = [t for t in TABLES if t not in data or not isinstance(data[t], list)]
-    if missing:
-        raise HTTPException(400, f"backup is missing: {', '.join(missing)}")
-    backup("before-import")
-    with connect() as con:
-        for t in reversed(TABLES):
-            con.execute(f"DELETE FROM {t}")
-        for t in TABLES:
-            cols = [r[1] for r in con.execute(f"PRAGMA table_info({t})")]
-            for row in data[t]:
-                keys = [k for k in row if k in cols]
-                if keys:
-                    con.execute(f"INSERT INTO {t}({','.join(keys)}) VALUES ({','.join('?' * len(keys))})",
-                                [row[k] for k in keys])
-        portfolio.record_snapshot(con)
-    return {"ok": True}
 
 
 # ---------- frontend ----------
@@ -555,6 +649,9 @@ def import_all(data: dict):
 class Credentials(BaseModel):
     username: str = Field(min_length=1, max_length=60)
     password: str = Field(min_length=1, max_length=200)
+
+
+DEMO = os.environ.get("NETWORTH_DEMO") == "1"
 
 
 class PasswordChange(BaseModel):
@@ -574,21 +671,40 @@ def _login_response(request: Request, token: str, body: dict):
 def auth_status(request: Request):
     with connect() as con:
         user = auth.session_user(con, request.cookies.get(auth.COOKIE))
-        return {"configured": auth.user_count(con) > 0, "authenticated": bool(user),
+        configured = auth.user_count(con) > 0
+        return {"configured": configured, "authenticated": bool(user),
                 "username": user["username"] if user else None,
+                "signup": auth.ALLOW_SIGNUP or not configured, "demo": DEMO,
                 "idle_minutes": auth.IDLE_MINUTES, "min_password": auth.MIN_PASSWORD}
+
+
+@app.post("/api/auth/register")
+def auth_register(body: Credentials, request: Request):
+    """Create a new account (with its own empty portfolio) and sign it in.
+    The first account also takes over any data that existed before accounts did."""
+    with connect() as con:
+        first = auth.user_count(con) == 0
+        if not first and not auth.ALLOW_SIGNUP:
+            raise HTTPException(403, "Sign-up is turned off on this server. Ask the owner for an account.")
+        if not auth.signup_allowed_now():
+            raise HTTPException(429, "Too many new accounts were created recently. Try again later.")
+        if (p := auth.username_problem(con, body.username)):
+            raise HTTPException(400, p)
+        if (p := auth.password_problem(body.password)):
+            raise HTTPException(400, p)
+        uid = auth.create_user(con, body.username, body.password)
+        auth.note_signup()
+        if first:
+            claim_orphans(con, uid)
+        elif DEMO:
+            demo_data.seed_user(con, uid)   # demo: every new account gets its own copy of the sample data
+        return _login_response(request, auth.new_session(con, uid), {"ok": True})
 
 
 @app.post("/api/auth/setup")
 def auth_setup(body: Credentials, request: Request):
-    with connect() as con:
-        if auth.user_count(con) > 0:
-            raise HTTPException(403, "An account already exists. Log in instead.")
-        if (p := auth.password_problem(body.password)):
-            raise HTTPException(400, p)
-        auth.create_user(con, body.username, body.password)
-        uid = auth.check_login(con, body.username, body.password)
-        return _login_response(request, auth.new_session(con, uid), {"ok": True})
+    """Older name for creating the first account."""
+    return auth_register(body, request)
 
 
 @app.post("/api/auth/login")
@@ -631,7 +747,8 @@ def auth_password(body: PasswordChange, request: Request):
         return _login_response(request, auth.new_session(con, user["user_id"]), {"ok": True})
 
 
-PUBLIC_PATHS = {"/login", "/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/setup", "/favicon.ico"}
+PUBLIC_PATHS = {"/login", "/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/setup",
+                "/api/auth/register", "/favicon.ico"}
 SECURITY_HEADERS = {
     # only this app's own scripts; no inline scripts, no external sites, no framing
     "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -668,6 +785,7 @@ async def security(request: Request, call_next):
             if path.startswith("/api/"):
                 return JSONResponse({"detail": "Not logged in"}, status_code=401)
             return RedirectResponse("/login", status_code=303)
+        request.state.user_id = user["user_id"]   # every data query below is limited to this account
 
     response = await call_next(request)
     for k, v in SECURITY_HEADERS.items():

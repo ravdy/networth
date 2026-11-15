@@ -95,11 +95,11 @@ def _table(doc, headers, rows, num_cols=(), widths=None, total_row=None, color_c
     return t
 
 
-def build_docx(con) -> bytes:
-    settings = portfolio.get_settings(con)
-    assets = portfolio.load_assets(con)
-    liabs = portfolio.load_liabilities(con)
-    summ = portfolio.summary(con)
+def build_docx(con, uid) -> bytes:
+    settings = portfolio.get_settings(con, uid)
+    assets = portfolio.load_assets(con, uid)
+    liabs = portfolio.load_liabilities(con, uid)
+    summ = portfolio.summary(con, uid)
     recs = recommendations.build(settings, assets, liabs, summ)
 
     doc = Document()
@@ -211,7 +211,7 @@ def build_docx(con) -> bytes:
                      f"{t['units']:g}" if t["units"] else "", t["note"] or ""] for t in txs],
                    num_cols=(2, 3), widths=(3, 2, 3.5, 2.5, 8))
 
-        growth = [p for p in portfolio.growth_series(con, a["id"]) if p["value_update"]]
+        growth = [p for p in portfolio.growth_series(con, uid, a["id"]) if p["value_update"]]
         if growth:
             doc.add_paragraph().add_run("Market value updates").bold = True
             _table(doc, ["Date", "Invested till date", "Market value", "Gain", "Growth %"],

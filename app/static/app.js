@@ -1041,7 +1041,7 @@ async function loadAccount() {
   try {
     const st = await api("/api/auth/status");
     $("#who").textContent = st.username || "";
-    $("#account-sub").textContent = `Signed in as ${st.username}. You're signed out automatically after ${st.idle_minutes} minutes without activity, and when you close the browser.`;
+    $("#account-sub").textContent = `Signed in as ${st.username}. Your portfolio is private to this account. You're signed out automatically after ${st.idle_minutes} minutes without activity, and when you close the browser.`;
   } catch (_) { /* ignore */ }
 }
 $("#btn-logout").addEventListener("click", async () => {
@@ -1065,6 +1065,7 @@ $("#password-form").addEventListener("submit", async (ev) => {
 async function refreshExcelStatus() {
   try {
     const st = await api("/api/excel/status");
+    if (st.host_path) $("#excel-path").textContent = st.host_path;
     const when = (iso) => (iso ? new Date(iso).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "never");
     $("#excel-status").innerHTML = !st.exists
       ? `No Excel file yet. Click <b>Create / refresh Excel file</b> to make one.`
@@ -1105,7 +1106,7 @@ $("#btn-excel").addEventListener("click", () => { showTab("settings"); $("#excel
 $("#excel-create").addEventListener("click", async () => {
   try {
     await api("/api/excel/export", { method: "POST" });
-    toast("Excel file written: Networth/data/networth.xlsx");
+    toast("Excel file written: " + $("#excel-path").textContent);
   } catch (e) {
     if (!/haven't been loaded/.test(e.message)) return toast("Error: " + e.message);
     if (!confirm("The Excel file has edits that haven't been loaded into the app.\n\nOK = overwrite the file and DISCARD those edits.\nCancel = keep them (then use 'Load changes from Excel').")) return;

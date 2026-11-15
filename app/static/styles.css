@@ -323,4 +323,7 @@ th.sorted { color: var(--text); }
 .login-card .primary { padding: 10px; font-size: 14px; }
 .login-error { background: #fdecec; color: #8a1f1f; border-radius: 8px; padding: 9px 12px; font-size: 13px; }
 .login-foot { text-align: center; font-size: 12px; }
+.login-switch { text-align: center; font-size: 14px; margin: 14px 0 0; }
+.login-switch a { color: var(--s1); font-weight: 600; }
+#demo-hint { margin-top: 10px; text-align: center; }
 @media (max-width: 560px) { .topbar .account { margin-left: 0; } }

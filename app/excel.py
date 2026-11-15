@@ -1,6 +1,6 @@
 """Two-way Excel sync.
 
-export:  writes data/networth.xlsx (Assets, Transactions, Liabilities, Lists, hidden _sync snapshot).
+export:  writes data/networth.xlsx (first account) or data/networth-user<id>.xlsx (Assets, Transactions, Liabilities, Lists, hidden _sync snapshot).
 import:  reads the workbook, works out what the user changed, previews it, applies it.
 
 Change detection is three-way: every exported value is also stored in the hidden `_sync` sheet.
@@ -23,7 +23,17 @@ from . import portfolio
 from .catalog import ASSET_TYPE_MAP, ASSET_TYPES, LIABILITY_TYPE_MAP, LIABILITY_TYPES
 from .db import DB_PATH, today
 
-XLSX_PATH = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "networth.xlsx")
+DATA_DIR = os.path.dirname(os.path.abspath(DB_PATH))
+
+
+def xlsx_name(con, uid) -> str:
+    """The first (original) account keeps data/networth.xlsx; every other account gets its own file."""
+    first = con.execute("SELECT MIN(id) FROM users").fetchone()[0]
+    return "networth.xlsx" if uid == first else f"networth-user{int(uid)}.xlsx"
+
+
+def xlsx_path(con, uid) -> str:
+    return os.path.join(DATA_DIR, xlsx_name(con, uid))
 
 INR = '[>=10000000]##\\,##\\,##\\,##0;[>=100000]##\\,##\\,##0;##,##0'
 DATE = "dd-mmm-yyyy"
@@ -105,11 +115,12 @@ def _style_sheet(ws, cols, widths, editable):
 
 # ---------------------------------------------------------------- export
 
-def build_workbook(con) -> Workbook:
-    assets = portfolio.load_assets(con)
-    liabs = portfolio.load_liabilities(con)
+def build_workbook(con, uid) -> Workbook:
+    assets = portfolio.load_assets(con, uid)
+    liabs = portfolio.load_liabilities(con, uid)
     txs = [dict(r) for r in con.execute(
-        "SELECT t.*, a.name AS asset_name FROM transactions t JOIN assets a ON a.id=t.asset_id ORDER BY a.name, t.date, t.id")]
+        "SELECT t.*, a.name AS asset_name FROM transactions t JOIN assets a ON a.id=t.asset_id "
+        "WHERE a.user_id=? ORDER BY a.name, t.date, t.id", (uid,))]
     snap = []
 
     wb = Workbook()
@@ -240,46 +251,49 @@ def build_workbook(con) -> Workbook:
     return wb
 
 
-def workbook_bytes(con) -> bytes:
+def workbook_bytes(con, uid) -> bytes:
     buf = io.BytesIO()
-    build_workbook(con).save(buf)
+    build_workbook(con, uid).save(buf)
     return buf.getvalue()
 
 
-def write_file(con) -> str:
-    tmp = XLSX_PATH + ".tmp"
-    build_workbook(con).save(tmp)
-    os.replace(tmp, XLSX_PATH)
-    _set(con, "_excel_synced_hash", _file_hash())
-    _set(con, "_excel_last_export", datetime.now().isoformat(timespec="seconds"))
-    return XLSX_PATH
+def write_file(con, uid) -> str:
+    path = xlsx_path(con, uid)
+    tmp = path + ".tmp"
+    build_workbook(con, uid).save(tmp)
+    os.replace(tmp, path)
+    _set(con, uid, "_excel_synced_hash", _file_hash(path))
+    _set(con, uid, "_excel_last_export", datetime.now().isoformat(timespec="seconds"))
+    return path
 
 
-def _set(con, k, v):
-    con.execute("INSERT INTO settings(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (k, v))
+def _set(con, uid, k, v):
+    con.execute("INSERT INTO settings(user_id, key, value) VALUES (?,?,?) "
+                "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value", (uid, k, v))
 
 
-def _get(con, k):
-    r = con.execute("SELECT value FROM settings WHERE key=?", (k,)).fetchone()
+def _get(con, uid, k):
+    r = con.execute("SELECT value FROM settings WHERE user_id=? AND key=?", (uid, k)).fetchone()
     return r["value"] if r else None
 
 
-def _file_hash():
-    with open(XLSX_PATH, "rb") as f:
+def _file_hash(path):
+    with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def status(con):
-    exists = os.path.exists(XLSX_PATH)
-    mtime = os.path.getmtime(XLSX_PATH) if exists else None
+def status(con, uid):
+    path = xlsx_path(con, uid)
+    exists = os.path.exists(path)
+    mtime = os.path.getmtime(path) if exists else None
     # "pending" = the file's contents differ from what the app last wrote, i.e. someone edited it
-    pending = bool(exists and _file_hash() != _get(con, "_excel_synced_hash"))
+    pending = bool(exists and _file_hash(path) != _get(con, uid, "_excel_synced_hash"))
     return {
         "exists": exists,
-        "host_path": "Networth/data/networth.xlsx",
+        "host_path": f"data/{xlsx_name(con, uid)}",
         "modified": datetime.fromtimestamp(mtime).isoformat(timespec="seconds") if mtime else None,
-        "last_export": _get(con, "_excel_last_export"),
-        "last_import": _get(con, "_excel_last_import"),
+        "last_export": _get(con, uid, "_excel_last_export"),
+        "last_import": _get(con, uid, "_excel_last_import"),
         "pending": pending,
     }
 
@@ -292,7 +306,7 @@ def _rows(ws, ncols):
             yield i, list(row) + [None] * (ncols - len(row))
 
 
-def plan_changes(con, data: bytes):
+def plan_changes(con, uid, data: bytes):
     """Return (changes, warnings, ops). Nothing is written until ops are executed."""
     wb = load_workbook(io.BytesIO(data), data_only=False)
     for name in ("Assets", "Transactions", "Liabilities"):
@@ -306,9 +320,11 @@ def plan_changes(con, data: bytes):
             if e:
                 snap[(e, int(i), f)] = json.loads(v) if v is not None else None
 
-    assets = {a["id"]: a for a in portfolio.load_assets(con)}
-    liabs = {l["id"]: l for l in portfolio.load_liabilities(con)}
-    txs = {r["id"]: dict(r) for r in con.execute("SELECT * FROM transactions")}
+    # only this user's records: every ID in the file is checked against these before anything is changed
+    assets = {a["id"]: a for a in portfolio.load_assets(con, uid)}
+    liabs = {l["id"]: l for l in portfolio.load_liabilities(con, uid)}
+    txs = {r["id"]: dict(r) for r in con.execute(
+        "SELECT t.* FROM transactions t JOIN assets a ON a.id=t.asset_id WHERE a.user_id=?", (uid,))}
     names = {a["name"].strip().lower(): a["id"] for a in assets.values()}
 
     changes, warnings, ops = [], [], []
@@ -522,7 +538,7 @@ def plan_changes(con, data: bytes):
     return changes, warnings, ops
 
 
-def apply_ops(con, ops):
+def apply_ops(con, uid, ops):
     new_ids = {}
     for op in ops:
         kind = op[0]
@@ -530,7 +546,8 @@ def apply_ops(con, ops):
             con.execute(op[1], op[2])
         elif kind == "new_asset":
             _, name, tkey, notes, inv, first_d, cur, vdate = op
-            aid = con.execute("INSERT INTO assets(name, type, notes) VALUES (?,?,?)", (name, tkey, notes)).lastrowid
+            aid = con.execute("INSERT INTO assets(name, type, notes, user_id) VALUES (?,?,?,?)",
+                              (name, tkey, notes, uid)).lastrowid
             new_ids[name.lower()] = aid
             if inv:
                 con.execute("INSERT INTO transactions(asset_id, date, kind, amount, note) VALUES (?,?,?,?,?)",
@@ -545,9 +562,9 @@ def apply_ops(con, ops):
         elif kind == "new_liab":
             _, name, tkey, prin, out, rate, emi, ten, sd, notes, odate = op
             lid = con.execute(
-                "INSERT INTO liabilities(name, type, principal, interest_rate, emi, tenure_months, start_date, notes) "
-                "VALUES (?,?,?,?,?,?,?,?)", (name, tkey, prin, rate, emi, ten, sd, notes)).lastrowid
+                "INSERT INTO liabilities(name, type, principal, interest_rate, emi, tenure_months, start_date, notes, user_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?)", (name, tkey, prin, rate, emi, ten, sd, notes, uid)).lastrowid
             if out is not None and out != prin:
                 con.execute("INSERT INTO liability_updates(liability_id, date, outstanding) VALUES (?,?,?)",
                             (lid, odate or today(), out))
-    _set(con, "_excel_last_import", datetime.now().isoformat(timespec="seconds"))
+    _set(con, uid, "_excel_last_import", datetime.now().isoformat(timespec="seconds"))

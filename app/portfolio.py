@@ -39,13 +39,15 @@ def _d(s: str) -> date:
     return date.fromisoformat(s[:10])
 
 
-def load_assets(con):
-    assets = [dict(r) for r in con.execute("SELECT * FROM assets ORDER BY id")]
+def load_assets(con, uid):
+    assets = [dict(r) for r in con.execute("SELECT * FROM assets WHERE user_id=? ORDER BY id", (uid,))]
     txs = defaultdict(list)
-    for r in con.execute("SELECT * FROM transactions ORDER BY date, id"):
+    for r in con.execute("SELECT t.* FROM transactions t JOIN assets a ON a.id=t.asset_id "
+                         "WHERE a.user_id=? ORDER BY t.date, t.id", (uid,)):
         txs[r["asset_id"]].append(dict(r))
     vals = defaultdict(list)
-    for r in con.execute("SELECT * FROM valuations ORDER BY date, id"):
+    for r in con.execute("SELECT v.* FROM valuations v JOIN assets a ON a.id=v.asset_id "
+                         "WHERE a.user_id=? ORDER BY v.date, v.id", (uid,)):
         vals[r["asset_id"]].append(dict(r))
 
     out = []
@@ -95,10 +97,11 @@ def load_assets(con):
     return out
 
 
-def load_liabilities(con):
-    rows = [dict(r) for r in con.execute("SELECT * FROM liabilities ORDER BY id")]
+def load_liabilities(con, uid):
+    rows = [dict(r) for r in con.execute("SELECT * FROM liabilities WHERE user_id=? ORDER BY id", (uid,))]
     upd = defaultdict(list)
-    for r in con.execute("SELECT * FROM liability_updates ORDER BY date, id"):
+    for r in con.execute("SELECT u.* FROM liability_updates u JOIN liabilities l ON l.id=u.liability_id "
+                         "WHERE l.user_id=? ORDER BY u.date, u.id", (uid,)):
         upd[r["liability_id"]].append(dict(r))
     out = []
     for l in rows:
@@ -125,8 +128,8 @@ def load_liabilities(con):
     return out
 
 
-def get_settings(con):
-    s = {r["key"]: r["value"] for r in con.execute("SELECT key, value FROM settings")}
+def get_settings(con, uid):
+    s = {r["key"]: r["value"] for r in con.execute("SELECT key, value FROM settings WHERE user_id=?", (uid,))}
     def num(k, default=None):
         try:
             return float(s[k]) if s.get(k) not in (None, "") else default
@@ -188,14 +191,15 @@ def by_group(assets):
     return out
 
 
-def summary(con):
-    assets = load_assets(con)
-    liabs = load_liabilities(con)
+def summary(con, uid):
+    assets = load_assets(con, uid)
+    liabs = load_liabilities(con, uid)
     total_assets = sum(a["current_value"] for a in assets)
     invested = sum(a["invested"] for a in assets)
     total_liabs = sum(l["outstanding"] for l in liabs)
     cats, types = allocation(assets)
-    history = [dict(r) for r in con.execute("SELECT * FROM snapshots ORDER BY date")]
+    history = [dict(r) for r in con.execute(
+        "SELECT date, assets, liabilities FROM snapshots WHERE user_id=? ORDER BY date", (uid,))]
     for h in history:
         h["net_worth"] = round(h["assets"] - h["liabilities"], 2)
     return {
@@ -214,13 +218,13 @@ def summary(con):
     }
 
 
-def record_snapshot(con):
-    assets = load_assets(con)
-    liabs = load_liabilities(con)
+def record_snapshot(con, uid):
+    assets = load_assets(con, uid)
+    liabs = load_liabilities(con, uid)
     con.execute(
-        "INSERT INTO snapshots(date, assets, liabilities) VALUES (?,?,?) "
-        "ON CONFLICT(date) DO UPDATE SET assets=excluded.assets, liabilities=excluded.liabilities",
-        (today(), sum(a["current_value"] for a in assets), sum(l["outstanding"] for l in liabs)),
+        "INSERT INTO snapshots(user_id, date, assets, liabilities) VALUES (?,?,?,?) "
+        "ON CONFLICT(user_id, date) DO UPDATE SET assets=excluded.assets, liabilities=excluded.liabilities",
+        (uid, today(), sum(a["current_value"] for a in assets), sum(l["outstanding"] for l in liabs)),
     )
 
 
@@ -243,13 +247,15 @@ def _invested_at(txs, d):
     return sum((x["amount"] if x["kind"] == "BUY" else -x["amount"]) for x in txs if x["date"] <= d)
 
 
-def growth_series(con, asset_id=None):
+def growth_series(con, uid, asset_id=None):
     """One point per date on which a purchase/sale or value update was recorded."""
-    where, args = ("WHERE asset_id=?", (asset_id,)) if asset_id else ("", ())
+    where, args = ("WHERE a.user_id=? AND a.id=?", (uid, asset_id)) if asset_id else ("WHERE a.user_id=?", (uid,))
     txs, vals = defaultdict(list), defaultdict(list)
-    for r in con.execute(f"SELECT * FROM transactions {where} ORDER BY date, id", args):
+    for r in con.execute(f"SELECT x.* FROM transactions x JOIN assets a ON a.id=x.asset_id {where} "
+                         "ORDER BY x.date, x.id", args):
         txs[r["asset_id"]].append(dict(r))
-    for r in con.execute(f"SELECT * FROM valuations {where} ORDER BY date, id", args):
+    for r in con.execute(f"SELECT x.* FROM valuations x JOIN assets a ON a.id=x.asset_id {where} "
+                         "ORDER BY x.date, x.id", args):
         vals[r["asset_id"]].append(dict(r))
     ids = set(txs) | set(vals)
     val_dates = {x["date"] for v in vals.values() for x in v}

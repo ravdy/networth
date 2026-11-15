@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS assets (
     name        TEXT NOT NULL,
     type        TEXT NOT NULL,
     notes       TEXT DEFAULT '',
-    created_at  TEXT NOT NULL DEFAULT (date('now'))
+    created_at  TEXT NOT NULL DEFAULT (date('now')),
+    user_id     INTEGER REFERENCES users(id) ON DELETE CASCADE
 );
 
 -- Every purchase (BUY) or sale/redemption (SELL) of an asset
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS liabilities (
     emi            REAL,
     start_date     TEXT,
     tenure_months  INTEGER,
-    notes          TEXT DEFAULT ''
+    notes          TEXT DEFAULT '',
+    user_id        INTEGER REFERENCES users(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS liability_updates (
@@ -55,15 +57,19 @@ CREATE TABLE IF NOT EXISTS liability_updates (
 );
 
 CREATE TABLE IF NOT EXISTS settings (
-    key    TEXT PRIMARY KEY,
-    value  TEXT
+    user_id  INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    key      TEXT NOT NULL,
+    value    TEXT,
+    PRIMARY KEY (user_id, key)
 );
 
 -- One row per day, refreshed on every change -> net worth history chart
 CREATE TABLE IF NOT EXISTS snapshots (
-    date         TEXT PRIMARY KEY,
+    user_id      INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    date         TEXT NOT NULL,
     assets       REAL NOT NULL,
-    liabilities  REAL NOT NULL
+    liabilities  REAL NOT NULL,
+    PRIMARY KEY (user_id, date)
 );
 
 -- login (passwords stored only as salted scrypt hashes)
@@ -92,6 +98,45 @@ def init_db():
         cols = {r[1] for r in con.execute("PRAGMA table_info(liabilities)")}
         if "tenure_months" not in cols:
             con.execute("ALTER TABLE liabilities ADD COLUMN tenure_months INTEGER")
+        _migrate_multi_user(con)
+        claim_orphans(con)
+
+
+def _migrate_multi_user(con):
+    """v2: every asset, liability, setting and snapshot belongs to one user."""
+    for t in ("assets", "liabilities"):
+        if "user_id" not in {r[1] for r in con.execute(f"PRAGMA table_info({t})")}:
+            con.execute(f"ALTER TABLE {t} ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE")
+    if "user_id" not in {r[1] for r in con.execute("PRAGMA table_info(settings)")}:
+        con.executescript("""
+            CREATE TABLE settings_v2 (user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                                      key TEXT NOT NULL, value TEXT, PRIMARY KEY (user_id, key));
+            INSERT INTO settings_v2(user_id, key, value) SELECT NULL, key, value FROM settings;
+            DROP TABLE settings;
+            ALTER TABLE settings_v2 RENAME TO settings;
+        """)
+    if "user_id" not in {r[1] for r in con.execute("PRAGMA table_info(snapshots)")}:
+        con.executescript("""
+            CREATE TABLE snapshots_v2 (user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                                       date TEXT NOT NULL, assets REAL NOT NULL, liabilities REAL NOT NULL,
+                                       PRIMARY KEY (user_id, date));
+            INSERT INTO snapshots_v2(user_id, date, assets, liabilities) SELECT NULL, date, assets, liabilities FROM snapshots;
+            DROP TABLE snapshots;
+            ALTER TABLE snapshots_v2 RENAME TO snapshots;
+        """)
+    con.execute("CREATE INDEX IF NOT EXISTS ix_assets_user ON assets(user_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_liabs_user ON liabilities(user_id)")
+
+
+def claim_orphans(con, uid=None):
+    """Data created before accounts existed belongs to the first account (the original owner)."""
+    if uid is None:
+        r = con.execute("SELECT MIN(id) FROM users").fetchone()
+        uid = r[0] if r else None
+    if uid is None:
+        return
+    for t in ("assets", "liabilities", "settings", "snapshots"):
+        con.execute(f"UPDATE {t} SET user_id=? WHERE user_id IS NULL", (uid,))
 
 
 @contextmanager

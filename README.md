@@ -30,6 +30,7 @@ Everything runs locally in Docker. Your data is kept in a SQLite file on your ow
   - The app keeps `data/networth.xlsx` up to date.
   - You can also edit the file in Excel and load the changes back; the app shows exactly what will change before applying anything.
 - **Exports:** Excel workbook, Word (`.docx`) report, and JSON backup and restore.
+- **Accounts:** anyone can sign up in the browser, and every account has its own private portfolio. The owner can turn sign-up off.
 - **Security:**
   - login with salted scrypt password hashes
   - server-side sessions with idle and absolute timeouts
@@ -48,7 +49,7 @@ cd networth
 docker compose up -d --build
 ```
 
-Open **http://localhost:8080** and create your account. The first visit asks for a username and a password of at least 10 characters. Use `http`, not `https`.
+Open **http://localhost:8080** and create your account. The first visit asks for a username (an email address works) and a password of at least 10 characters. Use `http`, not `https`.
 
 ```bash
 docker compose down        # stop (your data is kept)
@@ -64,7 +65,14 @@ docker compose -f docker-compose.demo.yml up -d --build
 docker compose -f docker-compose.demo.yml exec -T networth-demo python - < demo/seed_demo.py
 ```
 
-Open **http://localhost:8081** and sign in with `demo` / `demo-2026-show`. Running the second command again resets the demo to fresh data.
+Open **http://localhost:8081** and sign in with one of these sample accounts, or click **Create an account** to get your own copy of the sample portfolio:
+
+| Username | Password |
+|---|---|
+| `demo` | `demo-2026-show` |
+| `demouser@gmail.com` | `DemoUser@2026` |
+
+Running the second command again resets the demo: it deletes every demo account and restores these two with fresh data.
 
 The demo uses its own container, port and folder (`demo-data/`). The seed script refuses to run anywhere except in the demo container, so it can't overwrite real data.
 
@@ -72,13 +80,42 @@ The demo uses its own container, port and folder (`demo-data/`). The seed script
 docker compose -f docker-compose.demo.yml down
 ```
 
+## Accounts
+
+Each account has its own **private portfolio**: assets, liabilities, profile, history, Excel file and exports. One account can never see or change another account's data.
+
+### Create an account (sign up)
+
+1. Open the app (http://localhost:8080) in the browser.
+2. On the sign-in page, click **Create an account**. You can also go straight to `http://localhost:8080/login#register`.
+3. Enter a username (3–60 characters; letters, numbers and `. _ @ + -`, so an email address works) and a password of at least 10 characters, twice.
+4. Click **Create account**. You're signed in to your new, empty portfolio. In the demo, it starts with a copy of the sample data.
+
+The very first account created on a fresh install also takes over any data that was entered before accounts existed.
+
+### Sign in and out
+
+Use **Sign in** on the same page. **Log out** is at the top right of the app. **Settings → Account & security** shows who is signed in and lets you change your password.
+
+### Manage accounts (server owner)
+
+```bash
+docker compose exec networth python -m app.auth list                 # list accounts
+docker compose exec -it networth python -m app.auth reset <username>  # set a new password
+```
+
+To stop new sign-ups (for example, once everyone in your family has an account), add `NETWORTH_ALLOW_SIGNUP: "0"` under `environment:` in `docker-compose.yml`, then run `docker compose up -d`. The first account can always be created, even with sign-up off. New sign-ups are also limited to 20 per hour (`NETWORTH_SIGNUPS_PER_HOUR`).
+
 ## Your data
 
-- **Database:** a single SQLite file, `data/networth.db`. It is created on first run and kept on your machine, not inside Docker, so it survives container rebuilds and Docker resets.
+- **Database:** a single SQLite file, `data/networth.db`, holding every account's data. It is created on first run and kept on your machine, not inside Docker, so it survives container rebuilds and Docker resets.
+- **Excel files:** the first account uses `data/networth.xlsx`; other accounts use `data/networth-user<id>.xlsx`.
 - **Automatic backups:**
   - `data/backups/`: one per day, keeping the last 30
   - an extra copy before every import or Excel load
-- **Manual backup:** use **Settings → Export backup (JSON)**, or copy the `data/` folder.
+- **Manual backup:**
+  - **Settings → Export backup (JSON)** saves the signed-in account's data. **Import backup** replaces only that account's data.
+  - Copying the `data/` folder backs up every account.
 - **Restore a backup:**
 
   ```bash
@@ -91,7 +128,7 @@ docker compose -f docker-compose.demo.yml down
 
 ## Security
 
-- **Sign-in** is required for every page, export and download.
+- **Sign-in** is required for every page, export and download. Each account sees only its own data. Every request is checked against the signed-in account, and an ID belonging to someone else is treated as "not found".
   - Sessions end after 60 minutes idle, after 12 hours, or when the browser closes.
   - Change the limits with `NETWORTH_IDLE_MINUTES` and `NETWORTH_SESSION_HOURS` in `docker-compose.yml`.
   - Five wrong passwords lock the login for a while.
@@ -102,10 +139,10 @@ docker compose -f docker-compose.demo.yml down
 **Forgot your password?**
 
 ```bash
-docker compose exec -it networth python -m app.auth reset
+docker compose exec -it networth python -m app.auth reset <username>
 ```
 
-This sets a new password and signs out every session.
+This sets a new password and signs out all of that account's sessions. With only one account, the username can be left out.
 
 ## Using it
 
@@ -152,7 +189,8 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | [app/catalog.py](app/catalog.py) | asset and liability types and their segment weights |
 | [app/excel.py](app/excel.py) | Excel export and three-way sync |
 | [app/report.py](app/report.py) | Word report |
-| [app/auth.py](app/auth.py) | password hashing, sessions, lockout |
+| [app/auth.py](app/auth.py) | accounts, sign-up, password hashing, sessions, lockout |
 | [app/db.py](app/db.py) | SQLite schema and backups |
 | [app/static/](app/static/) | UI: plain HTML/CSS/JS, no build step |
-| [demo/seed_demo.py](demo/seed_demo.py) | fictional demo data |
+| [app/demo_data.py](app/demo_data.py) | fictional sample portfolio for the demo |
+| [demo/seed_demo.py](demo/seed_demo.py) | resets the demo instance |
